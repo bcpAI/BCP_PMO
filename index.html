@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Spline+Sans:wght@400;500;600;700&family=Spline+Sans+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -497,7 +498,8 @@ const LIB = {
   pdf:   typeof window.jspdf !== "undefined",
   chart: typeof Chart !== "undefined",
   pptx:  typeof PptxGenJS !== "undefined",
-  docx:  typeof window.docx !== "undefined" && typeof saveAs !== "undefined"
+  docx:  typeof window.docx !== "undefined" && typeof saveAs !== "undefined",
+  exceljs: typeof ExcelJS !== "undefined"
 };
 function libBanner(){
   if(LIB.xlsx && LIB.pdf && LIB.chart) return;
@@ -537,7 +539,7 @@ function daysLate(a){ const due=effDue(a); if(!isLate(a)) return 0; return daysB
 
 /* ---------- État global ---------- */
 let DB = { projects:[], activeId:null, settings:{ consultant:"", logo:"" } };
-let UI = { view:"dashboard", crEditId:null, filters:{q:"",sp:"",statut:"",resp:"",lateOnly:false}, decFilters:{q:"",statut:"",instance:""}, charts:{} };
+let UI = { view:"dashboard", crEditId:null, filters:{q:"",sp:"",statut:"",resp:"",lateOnly:false}, decFilters:{q:"",statut:"",instance:""}, qSeuil:0.65, charts:{} };
 
 function load(){
   try{ const raw=localStorage.getItem(LS_KEY); if(raw){ DB=JSON.parse(raw); } }catch(e){ console.warn("load fail",e); }
@@ -1078,6 +1080,7 @@ const NAV=[
     {id:"dashboard",ico:"◆",label:"Tableau de bord"},
     {id:"actions",ico:"☰",label:"Plan d'action"},
     {id:"relances",ico:"⚑",label:"Relances & retards",badge:true},
+    {id:"qualite",ico:"🔍",label:"Analyse qualité"},
   ]},
   {group:"Reporting",items:[
     {id:"avancement",ico:"📈",label:"Suivi avancement"},
@@ -1172,7 +1175,7 @@ function render(){
 function viewTitle(v){ return {dashboard:"Tableau de bord",actions:"Plan d'action",relances:"Relances & retards",
   avancement:"Suivi de l'avancement",comite:"Support comité",comparatif:"Avancement M vs M-1",
   cr:"Saisie depuis comptes rendus",crs:UI.crEditId?"Édition du compte rendu":"Comptes rendus PMO",
-  decisions:"Registre des décisions",data:"Import / Export des données"}[v]||"PMO"; }
+  decisions:"Registre des décisions",qualite:"Analyse qualité du plan",data:"Import / Export des données"}[v]||"PMO"; }
 
 function topbarActions(){
   if(UI.view==="actions") return `<button class="btn btn-primary" onclick="openActionModal()"><span class="ico">+</span> Nouvelle action</button>`;
@@ -1187,6 +1190,7 @@ function topbarActions(){
                             <button class="btn btn-gold" onclick="exportCRWord('${UI.crEditId}')"><span class="ico">▤</span> Télécharger Word</button>`;
     return `<button class="btn btn-primary" onclick="crCreate()"><span class="ico">+</span> Nouveau compte rendu</button>`;
   }
+  if(UI.view==="qualite") return `<button class="btn btn-primary" onclick="runQualite()"><span class="ico">🔍</span> Relancer l'analyse</button>`;
   if(UI.view==="data") return "";
   return `<button class="btn btn-ghost btn-sm" onclick="go('data')"><span class="ico">⤓</span> Export</button>
           <button class="btn btn-primary" onclick="openActionModal()"><span class="ico">+</span> Action</button>`;
@@ -1201,7 +1205,7 @@ function renderView(){
   const el=$("#view"); if(!el) return;
   const fn={dashboard:viewDashboard,actions:viewActions,relances:viewRelances,
     avancement:viewAvancement,comite:viewComite,comparatif:viewComparatif,
-    cr:viewCR,crs:viewCRs,decisions:viewDecisions,data:viewData}[UI.view];
+    cr:viewCR,crs:viewCRs,decisions:viewDecisions,qualite:viewQualite,data:viewData}[UI.view];
   el.innerHTML = fn?fn():"<div class='empty'>Vue introuvable</div>";
   if(typeof window["after_"+UI.view]==="function") window["after_"+UI.view]();
 }
@@ -3845,6 +3849,249 @@ function exportComitePPT(){
 /* ============================================================
    IMPORT / EXPORT EXCEL
    ============================================================ */
+/* ============================================================
+   MODULE — ANALYSE QUALITÉ DU PLAN (100% local, aucune donnée ne sort)
+   - Détection de doublons sémantiques (similarité de texte)
+   - Contrôles de cohérence de base
+   ============================================================ */
+
+/* Mots-vides français à ignorer dans la comparaison */
+const Q_STOPWORDS = new Set(("au aux avec ce ces dans de des du elle en et eux il je la le les leur lui ma mais me "+
+  "meme mes moi mon ne nos notre nous on ou par pas pour qu que qui sa se ses son sur ta te tes toi ton tu un une "+
+  "vos votre vous c d j l m n s t y ete etre a afin ainsi alors donc tout toute tous toutes plus moins tres "+
+  "cette cet leurs selon entre vers chez sans sous aussi comme car dont ni ou lors apres avant pendant").split(" "));
+
+/* Lexique de synonymes métier PMO : chaque variante est ramenée à un terme pivot.
+   Les clés sont déjà tronquées/sans accent pour matcher après normalisation. */
+const Q_SYNO = {
+  // mettre en place / définir / élaborer / créer / concevoir / réaliser → "etablir"
+  mettre:"etabli", place:"etabli", defini:"etabli", elabor:"etabli", creer:"etabli",
+  concev:"etabli", conception:"etabli", realis:"etabli", formal:"etabli", constr:"etabli",
+  instau:"etabli", deploi:"etabli", proposer:"etabli",
+  // process / procédure / circuit / dispositif / mécanisme / parcours → "proces"
+  proces:"proces", procedu:"proces", circuit:"proces", disposi:"proces", mecani:"proces",
+  parcour:"proces", workflo:"proces", flux:"proces",
+  // analyser / diagnostiquer / étudier / examiner / évaluer → "analys"
+  analys:"analys", diagno:"analys", etudi:"analys", examin:"analys", evalue:"analys", evaluat:"analys",
+  // cartographier / cartographie / modéliser / schématiser → "cartog"
+  cartog:"cartog", modeli:"cartog", schema:"cartog", schematis:"cartog",
+  // impayé / impayés / créance → gardés proches
+  impaye:"impay", creance:"creanc",
+  // client / clientèle → "client"
+  cliente:"client",
+  // suivi / pilotage / monitoring → "suivi"
+  pilota:"suivi", monitor:"suivi", tracab:"suivi", tracer:"suivi"
+};
+
+/* Normalise un texte : minuscules, sans accents, sans ponctuation, mots-vides retirés,
+   troncature stable à 7 caractères puis application du lexique de synonymes. */
+function qNormalizeWords(txt){
+  if(!txt) return [];
+  let s=String(txt).toLowerCase()
+    .normalize("NFD").replace(/[̀-ͯ]/g,"")   // retire les accents
+    .replace(/[^a-z0-9\s]/g," ")                        // ponctuation -> espace
+    .replace(/\s+/g," ").trim();
+  const out=[];
+  s.split(" ").forEach(w=>{
+    if(w.length<=2 || Q_STOPWORDS.has(w)) return;
+    let root=w.slice(0,7);                 // troncature stable (évite les suffixes incohérents)
+    // appliquer synonymes : on teste le mot entier tronqué, sinon des préfixes connus
+    if(Q_SYNO[root]) root=Q_SYNO[root];
+    else { for(const k in Q_SYNO){ if(w.startsWith(k)){ root=Q_SYNO[k]; break; } } }
+    out.push(root);
+  });
+  return out;
+}
+
+/* Score de similarité entre deux descriptions (0 à 1) : mélange Jaccard + couverture */
+function qSimilarity(aWords, bWords){
+  if(!aWords.length || !bWords.length) return 0;
+  const A=new Set(aWords), B=new Set(bWords);
+  let inter=0; A.forEach(w=>{ if(B.has(w)) inter++; });
+  const union=new Set([...A,...B]).size;
+  const jaccard = inter/union;                         // ressemblance globale
+  const coverage = inter/Math.min(A.size,B.size);      // le plus petit est-il contenu dans le grand
+  // la couverture pèse plus : rattrape les descriptions de longueurs différentes
+  return 0.4*jaccard + 0.6*coverage;
+}
+
+/* Normalise une clé de responsable pour détecter les variantes d'écriture */
+function qRespKey(r){
+  if(!r) return "";
+  return String(r).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]/g,"");
+}
+
+/* ---------- Moteur d'analyse ---------- */
+function analyzeQualite(seuil){
+  const acts=actions();
+  const result={ doublons:[], respVariants:[], refDoublons:[], incoherences:[], total:acts.length };
+  if(!acts.length) return result;
+
+  // Pré-calcul des mots normalisés
+  const prepped=acts.map(a=>({a, words:qNormalizeWords(a.description)}));
+
+  // 1) Doublons sémantiques (toutes les paires)
+  for(let i=0;i<prepped.length;i++){
+    for(let j=i+1;j<prepped.length;j++){
+      const sim=qSimilarity(prepped[i].words, prepped[j].words);
+      if(sim>=seuil){
+        result.doublons.push({ a:prepped[i].a, b:prepped[j].a, score:Math.round(sim*100) });
+      }
+    }
+  }
+  result.doublons.sort((x,y)=>y.score-x.score);
+
+  // 2) Variantes de responsable (même clé normalisée, écritures différentes)
+  const respMap={};
+  acts.forEach(a=>{ if(!a.responsable) return; const k=qRespKey(a.responsable);
+    (respMap[k]=respMap[k]||new Set()).add(a.responsable.trim()); });
+  Object.values(respMap).forEach(set=>{ if(set.size>1) result.respVariants.push([...set]); });
+
+  // 3) Doublons de référence
+  const refMap={};
+  acts.forEach(a=>{ if(!a.ref) return; (refMap[a.ref]=refMap[a.ref]||[]).push(a); });
+  Object.entries(refMap).forEach(([ref,list])=>{ if(list.length>1) result.refDoublons.push({ref,list}); });
+
+  // 4) Incohérences de base (bonus gratuit)
+  acts.forEach(a=>{
+    const due=effDue(a);
+    if(a.dateDebutPlan && due && due < a.dateDebutPlan)
+      result.incoherences.push({a,msg:"Échéance antérieure à la date de début"});
+    if(a.statut==="Terminé" && (+a.avancement||0)<100)
+      result.incoherences.push({a,msg:`Statut « Terminé » mais avancement à ${+a.avancement||0}%`});
+    if((+a.avancement||0)===100 && a.statut!=="Terminé")
+      result.incoherences.push({a,msg:`Avancement à 100% mais statut « ${a.statut} »`});
+    if(a.statut==="À faire" && isLate(a))
+      result.incoherences.push({a,msg:"Échéance dépassée mais statut encore « À faire »"});
+  });
+
+  return result;
+}
+
+/* ---------- VUE — Analyse qualité ---------- */
+function viewQualite(){
+  const p=activeProject(); if(!p) return `<div class="empty">Aucun projet actif</div>`;
+  if(UI.qSeuil==null) UI.qSeuil=0.65;
+  const seuil=UI.qSeuil;
+  const R=analyzeQualite(seuil);
+  const nbAlertes=R.doublons.length+R.respVariants.length+R.refDoublons.length+R.incoherences.length;
+
+  const esc2=esc;
+  return `
+  <div class="panel">
+    <div class="panel-body" style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+      <div style="flex:1;min-width:220px">
+        <div style="font-size:13px;color:var(--ink-soft)">Analyse locale du plan d'action — <strong>${esc2(p.name)}</strong></div>
+        <div style="font-size:12px;color:var(--ink-soft);margin-top:4px">🔒 Tout est calculé dans votre navigateur. Aucune donnée n'est envoyée à l'extérieur.</div>
+      </div>
+      <div style="text-align:center">
+        <div style="font-family:'Inter',system-ui,sans-serif;font-size:34px;font-weight:700;color:${nbAlertes?'var(--rust)':'var(--ok)'};line-height:1">${nbAlertes}</div>
+        <div style="font-size:11px;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.06em">point${nbAlertes>1?"s":""} d'attention</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head"><h2>🔁 Doublons probables</h2><div class="spacer"></div>
+      <span class="sub">${R.doublons.length} paire${R.doublons.length>1?"s":""} détectée${R.doublons.length>1?"s":""}</span></div>
+    <div class="panel-body">
+      <div style="display:flex;align-items:center;gap:14px;margin-bottom:18px;flex-wrap:wrap">
+        <label style="font-size:12.5px;color:var(--ink-soft);font-weight:600">Sensibilité de détection</label>
+        <input type="range" min="40" max="90" step="5" value="${Math.round(seuil*100)}" style="flex:1;max-width:260px;accent-color:var(--forest)"
+          oninput="document.getElementById('qSeuilVal').textContent=this.value+'%'" onchange="setQSeuil(this.value)">
+        <span id="qSeuilVal" style="font-family:'Spline Sans Mono',monospace;font-weight:600;color:var(--forest);min-width:46px">${Math.round(seuil*100)}%</span>
+        <span style="font-size:11.5px;color:var(--ink-soft)">seuil bas = plus de suggestions · seuil haut = quasi-identiques</span>
+      </div>
+      ${R.doublons.length===0
+        ? `<div class="empty" style="padding:28px"><div class="e-ico">✓</div><h3>Aucun doublon au seuil de ${Math.round(seuil*100)}%</h3><p>Baissez la sensibilité pour repérer des ressemblances plus lointaines.</p></div>`
+        : R.doublons.map((d,i)=>qDoublonCard(d,i)).join("")}
+    </div>
+  </div>
+
+  ${R.respVariants.length? `<div class="panel">
+    <div class="panel-head"><h2>👤 Responsables écrits de plusieurs façons</h2></div>
+    <div class="panel-body">
+      <p style="color:var(--ink-soft);font-size:13px;margin-bottom:12px">Ces libellés désignent probablement la même personne/entité mais sont saisis différemment — à uniformiser pour des filtres et relances fiables.</p>
+      ${R.respVariants.map(set=>`<div class="blocker-card" style="border-left-color:var(--warn)">
+        <span class="bc-ico" style="color:var(--warn)">≈</span>
+        <div class="bc-body"><div class="bc-title" style="font-size:13.5px">${set.map(x=>`<span class="ref-chip" style="margin-right:6px">${esc2(x)}</span>`).join("")}</div>
+          <div class="bc-meta">${set.length} variantes du même responsable</div></div>
+      </div>`).join("")}
+    </div>
+  </div>`:""}
+
+  ${R.refDoublons.length? `<div class="panel">
+    <div class="panel-head"><h2 style="color:var(--rust)">🏷 Références en double</h2></div>
+    <div class="panel-body">
+      ${R.refDoublons.map(r=>`<div class="blocker-card"><span class="bc-ico">⚠</span><div class="bc-body">
+        <div class="bc-title">Réf. <span class="ref-chip">${esc2(r.ref)}</span> utilisée par ${r.list.length} actions</div>
+        <div class="bc-meta">${r.list.map(a=>esc2(a.description.slice(0,40))).join(" · ")}</div></div></div>`).join("")}
+    </div>
+  </div>`:""}
+
+  ${R.incoherences.length? `<div class="panel">
+    <div class="panel-head"><h2 style="color:var(--rust)">⚠ Incohérences de saisie</h2><div class="spacer"></div>
+      <span class="sub">${R.incoherences.length} à vérifier</span></div>
+    <div class="panel-body">
+      ${R.incoherences.map(x=>`<div class="blocker-card" style="border-left-color:var(--rust)">
+        <span class="bc-ico">⚠</span>
+        <div class="bc-body"><div class="bc-title" style="font-size:13.5px">${esc2(x.a.description.slice(0,90))}${x.a.description.length>90?"…":""}</div>
+          <div class="bc-meta"><span class="ref-chip">${esc2(x.a.ref||"")}</span><span style="color:var(--rust);font-weight:600">${esc2(x.msg)}</span></div></div>
+        <button class="btn btn-ghost btn-sm" onclick="openActionModal('${x.a.id}')">Corriger</button>
+      </div>`).join("")}
+    </div>
+  </div>`:""}
+  `;
+}
+
+function qDoublonCard(d,i){
+  const scoreCol = d.score>=80?"var(--rust)":d.score>=65?"var(--warn)":"var(--ink-soft)";
+  const line=(a)=>`<div style="flex:1;min-width:0;padding:10px 12px;background:var(--paper-2);border-radius:8px;border:1px solid var(--line)">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
+        <span class="ref-chip">${esc(a.ref||"—")}</span>
+        <span class="tag ${STATUT_CLASS[a.statut]}" style="font-size:10px"><span class="tag-dot"></span>${esc(a.statut)}</span>
+      </div>
+      <div style="font-size:13px;line-height:1.4;color:var(--ink)">${esc(a.description)}</div>
+      <div style="font-size:11px;color:var(--ink-soft);margin-top:5px">👤 ${esc(a.responsable||"—")}${a.sousProjet?` · ▪ ${esc(a.sousProjet)}`:""}</div>
+      <div style="margin-top:8px;display:flex;gap:6px">
+        <button class="btn btn-ghost btn-sm" onclick="openActionModal('${a.id}')">Ouvrir</button>
+        <button class="btn btn-ghost btn-sm" style="color:var(--rust)" onclick="qMerge('${d.a.id}','${d.b.id}','${a.id}')" title="Garder celle-ci, supprimer l'autre">Garder celle-ci</button>
+      </div>
+    </div>`;
+  return `<div style="border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px;background:var(--card)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+      <span style="font-weight:700;font-size:15px;color:${scoreCol}">${d.score}% de similarité</span>
+      <span style="font-size:11.5px;color:var(--ink-soft)">— ces deux actions se ressemblent, vérifiez s'il s'agit d'un doublon</span>
+    </div>
+    <div style="display:flex;gap:12px;align-items:stretch;flex-wrap:wrap">
+      ${line(d.a)}
+      <div style="display:flex;align-items:center;color:var(--ink-soft);font-weight:700">≈</div>
+      ${line(d.b)}
+    </div>
+  </div>`;
+}
+
+function setQSeuil(v){ UI.qSeuil=(+v)/100; renderView(); }
+function runQualite(){ renderView(); toast("Analyse relancée"); }
+
+/* Fusion : garde l'action keepId, supprime l'autre de la paire, reporte le commentaire */
+function qMerge(idA,idB,keepId){
+  if(!requirePerm("delete","Fusion de doublon")) return;
+  const p=activeProject(); if(!p) return;
+  const dropId = keepId===idA ? idB : idA;
+  const keep=p.actions.find(x=>x.id===keepId);
+  const drop=p.actions.find(x=>x.id===dropId);
+  if(!keep||!drop) return;
+  if(!confirm(`Fusionner ces deux actions ?\n\nCONSERVÉE : ${keep.description.slice(0,80)}\nSUPPRIMÉE : ${drop.description.slice(0,80)}\n\nLe commentaire de l'action supprimée sera reporté sur la conservée.`)) return;
+  // reporter le commentaire de la supprimée
+  const note=`[Fusionnée avec ${drop.ref||"action"} : ${drop.description.slice(0,60)}]`;
+  keep.commentaire = (keep.commentaire? keep.commentaire+" " : "") + note + (drop.commentaire? " — "+drop.commentaire : "");
+  p.actions = p.actions.filter(x=>x.id!==dropId);
+  reindexRefs(p);
+  save(); render();
+  toast("Actions fusionnées — doublon supprimé");
+}
+
 function viewData(){
   return `
   <div class="grid-2">
@@ -3853,7 +4100,8 @@ function viewData(){
       <div class="panel-body">
         <p style="color:var(--ink-soft);font-size:13px;margin-bottom:16px">Sauvegardez ou partagez vos données. L'export Excel reprend la structure de votre modèle (plan d'action + dashboard).</p>
         <div style="display:flex;flex-direction:column;gap:10px">
-          <button class="btn btn-primary" onclick="exportExcel()" style="justify-content:flex-start"><span class="ico">▦</span> Exporter le projet actif (Excel)</button>
+          <button class="btn btn-primary" onclick="exportPlanBNA()" style="justify-content:flex-start;background:#1A4190"><span class="ico">★</span> Plan d'action — diffusion (Excel mis en forme)</button>
+          <button class="btn btn-ghost" onclick="exportExcel()" style="justify-content:flex-start"><span class="ico">▦</span> Export Excel brut (données)</button>
           <button class="btn btn-gold" onclick="exportComitePDF()" style="justify-content:flex-start"><span class="ico">▣</span> Exporter le support comité (PDF)</button>
           <button class="btn btn-ghost" onclick="exportBackup()" style="justify-content:flex-start"><span class="ico">⬇</span> Sauvegarde complète (tous projets, .json)</button>
         </div>
@@ -3965,6 +4213,291 @@ function exportExcel(){
   XLSX.writeFile(wb,`PlanAction_${(p.code||"PRJ")}_${todayISO()}.xlsx`);
   toast("Projet exporté en Excel");
 }
+/* ============================================================
+   EXPORT — Plan d'action mis en forme pour diffusion (BNA)
+   Couleurs : bleu #1A4190, vert #00997A, blanc
+   Librairie : ExcelJS (styles, barres de données, bordures)
+   Feuille 1 : Plan d'action détaillé, groupé par sous-projet
+   Feuille 2 : Synthèse (KPIs + récap par sous-projet)
+   ============================================================ */
+async function exportPlanBNA(){
+  if(!LIB.exceljs){ toast("Mise en forme indisponible (connexion requise)","warn"); return; }
+  const p=activeProject(); if(!p){ toast("Aucun projet actif","warn"); return; }
+  const acts=p.actions||[];
+  if(!acts.length){ toast("Aucune action à exporter","warn"); return; }
+
+  // Palette BNA (ARGB pour ExcelJS)
+  const BLEU="FF1A4190", BLEU_D="FF13306B", VERT="FF00997A", VERT_CL="FFE1F2EE",
+        BLANC="FFFFFFFF", GRIS="FF6B6F78", GRIS_CL="FFF4F6F8", LIGNE="FFD9E0E6",
+        ROUGE="FFB3361F", ROUGE_CL="FFFBE9E6", BLEU_CL="FFE8EDF5", ORANGE="FFB8893D";
+
+  const wb=new ExcelJS.Workbook();
+  wb.creator="PMO Suite — BCP Consult & Solve";
+  wb.created=new Date();
+
+  /* ========== FEUILLE 1 — PLAN D'ACTION ========== */
+  const ws=wb.addWorksheet("Plan d'action",{
+    views:[{showGridLines:false}],
+    pageSetup:{orientation:"landscape",fitToPage:true,fitToWidth:1,fitToHeight:0,margins:{left:0.3,right:0.3,top:0.4,bottom:0.4,header:0.2,footer:0.2}}
+  });
+
+  const COLS=[
+    {key:"ref",   w:13, t:"Réf."},
+    {key:"sp",    w:28, t:"Sous-projet"},
+    {key:"desc",  w:55, t:"Description de l'action"},
+    {key:"resp",  w:18, t:"Responsable"},
+    {key:"type",  w:17, t:"Type"},
+    {key:"prio",  w:11, t:"Priorité"},
+    {key:"deb",   w:13, t:"Début prév."},
+    {key:"fin",   w:13, t:"Échéance"},
+    {key:"rev",   w:13, t:"Éch. révisée"},
+    {key:"av",    w:16, t:"Avancement"},
+    {key:"statut",w:13, t:"Statut"},
+    {key:"alerte",w:8,  t:"Alerte"},
+    {key:"liv",   w:26, t:"Livrables"},
+    {key:"com",   w:36, t:"Commentaire"}
+  ];
+  ws.columns=COLS.map(c=>({width:c.w}));
+  const NC=COLS.length; // nb colonnes
+  const lastCol=String.fromCharCode(64+NC); // N
+
+  // --- Bandeau titre (ligne 1-2) ---
+  ws.mergeCells(1,1,1,NC);
+  const tC=ws.getCell(1,1);
+  tC.value=`PLAN D'ACTION — ${p.name}`;
+  tC.font={name:"Calibri",size:16,bold:true,color:{argb:BLANC}};
+  tC.fill={type:"pattern",pattern:"solid",fgColor:{argb:BLEU}};
+  tC.alignment={vertical:"middle",horizontal:"left",indent:1};
+  ws.getRow(1).height=30;
+
+  ws.mergeCells(2,1,2,NC);
+  const stC=ws.getCell(2,1);
+  const dStr=new Date().toLocaleDateString("fr-FR",{day:"2-digit",month:"long",year:"numeric"});
+  stC.value={richText:[
+    {text:`${p.client||""}`,font:{bold:true,color:{argb:BLANC},size:10}},
+    {text:`     Version ${p.version||"1.0"}  ·  Édité le ${dStr}  ·  ${acts.length} action(s)`,font:{color:{argb:"FFD8E2F0"},size:10}}
+  ]};
+  stC.fill={type:"pattern",pattern:"solid",fgColor:{argb:BLEU_D}};
+  stC.alignment={vertical:"middle",horizontal:"left",indent:1};
+  ws.getRow(2).height=20;
+
+  // ligne vide 3
+  ws.getRow(3).height=6;
+
+  // --- En-tête de colonnes (ligne 4) ---
+  const HR=4;
+  const hr=ws.getRow(HR);
+  COLS.forEach((c,i)=>{
+    const cell=hr.getCell(i+1);
+    cell.value=c.t;
+    cell.font={name:"Calibri",size:10,bold:true,color:{argb:BLANC}};
+    cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:BLEU}};
+    cell.alignment={vertical:"middle",horizontal:(["desc","sp","liv","com"].includes(c.key)?"left":"center"),wrapText:true,indent:(["desc","sp","liv","com"].includes(c.key)?1:0)};
+    cell.border={top:{style:"thin",color:{argb:BLEU_D}},bottom:{style:"medium",color:{argb:VERT}},left:{style:"thin",color:{argb:BLEU_D}},right:{style:"thin",color:{argb:BLEU_D}}};
+  });
+  hr.height=26;
+
+  // --- Corps : groupé par sous-projet ---
+  const groups={};
+  acts.forEach(a=>{ const k=a.sousProjet||"(Sans sous-projet)"; (groups[k]=groups[k]||[]).push(a); });
+
+  const statutFill={"Terminé":VERT,"En cours":BLEU,"Bloqué":ROUGE,"À faire":GRIS};
+  const prioColor={"Haute":ROUGE,"Moyenne":ORANGE,"Faible":VERT};
+  const fmtD=iso=>{ if(!iso) return ""; const d=new Date(iso+"T00:00:00"); if(isNaN(d)) return ""; return d.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit",year:"2-digit"}); };
+
+  let r=HR+1;
+  const avCells=[]; // pour la barre de données
+  let zebra=false;
+
+  Object.entries(groups).forEach(([sp,list])=>{
+    // ligne de groupe (bandeau vert clair)
+    ws.mergeCells(r,1,r,NC);
+    const gC=ws.getCell(r,1);
+    const done=list.filter(a=>a.statut==="Terminé").length;
+    const avgG=Math.round(list.reduce((s,a)=>s+(+a.avancement||0),0)/list.length);
+    gC.value={richText:[
+      {text:`▸ ${sp}`,font:{bold:true,size:11,color:{argb:VERT}}},
+      {text:`     ${list.length} action(s)  ·  ${done} terminée(s)  ·  ${avgG}% d'avancement moyen`,font:{size:9.5,color:{argb:GRIS}}}
+    ]};
+    gC.fill={type:"pattern",pattern:"solid",fgColor:{argb:VERT_CL}};
+    gC.alignment={vertical:"middle",horizontal:"left",indent:1};
+    ws.getRow(r).height=20;
+    ws.getRow(r).outlineLevel=0;
+    r++;
+
+    list.forEach(a=>{
+      const row=ws.getRow(r);
+      const late=isLate(a);
+      const bg = late ? ROUGE_CL : (zebra? GRIS_CL : BLANC);
+      const vals={
+        ref:a.ref||"", sp:a.sousProjet||"", desc:a.description||"", resp:a.responsable||"",
+        type:a.type||"", prio:a.priorite||"", deb:fmtD(a.dateDebutPlan), fin:fmtD(a.dateFinPlan),
+        rev:fmtD(a.dateFinRevisee), av:(+a.avancement||0)/100, statut:a.statut||"",
+        alerte: late?"⚠":"", liv:a.livrables||"", com:a.commentaire||""
+      };
+      COLS.forEach((c,i)=>{
+        const cell=row.getCell(i+1);
+        cell.value=vals[c.key];
+        cell.font={name:"Calibri",size:9.5,color:{argb:"FF40444D"}};
+        cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:bg}};
+        cell.border={top:{style:"hair",color:{argb:LIGNE}},bottom:{style:"hair",color:{argb:LIGNE}},left:{style:"hair",color:{argb:LIGNE}},right:{style:"hair",color:{argb:LIGNE}}};
+        cell.alignment={vertical:"middle",wrapText:(["desc","liv","com","sp"].includes(c.key)),
+          horizontal:(["desc","liv","com","sp"].includes(c.key)?"left":"center"),indent:(["desc","liv","com","sp"].includes(c.key)?1:0)};
+
+        if(c.key==="ref"){ cell.font={name:"Consolas",size:9,bold:true,color:{argb:BLEU}}; }
+        if(c.key==="av"){ cell.numFmt="0%"; cell.alignment={vertical:"middle",horizontal:"center"}; avCells.push(cell.address); }
+        if(c.key==="prio"){ cell.font={name:"Calibri",size:9.5,bold:true,color:{argb:prioColor[a.priorite]||GRIS}}; }
+        if(c.key==="alerte"&&late){ cell.font={name:"Calibri",size:12,bold:true,color:{argb:ROUGE}}; }
+        if(c.key==="fin"&&late){ cell.font={name:"Calibri",size:9.5,bold:true,color:{argb:ROUGE}}; }
+        if(c.key==="statut"){
+          cell.font={name:"Calibri",size:9,bold:true,color:{argb:BLANC}};
+          cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:statutFill[a.statut]||GRIS}};
+          cell.alignment={vertical:"middle",horizontal:"center"};
+        }
+      });
+      row.height = (a.description&&a.description.length>70)?30:18;
+      r++; zebra=!zebra;
+    });
+  });
+
+  const lastDataRow=r-1;
+
+  // --- Barre de données sur la colonne Avancement (colonne J = 10) ---
+  const avColLetter=String.fromCharCode(64+10); // J
+  ws.addConditionalFormatting({
+    ref:`${avColLetter}${HR+1}:${avColLetter}${lastDataRow}`,
+    rules:[{
+      type:"dataBar",
+      cfvo:[{type:"num",value:0},{type:"num",value:1}],
+      color:{argb:VERT},
+      gradient:false,
+      showValue:true,
+      border:false
+    }]
+  });
+
+  // Figer les volets (sous l'en-tête)
+  ws.views=[{state:"frozen",ySplit:HR,showGridLines:false}];
+
+  // Répétition de la ligne d'en-tête sur chaque page imprimée
+  ws.pageSetup.printTitlesRow=`${HR}:${HR}`;
+  // Pied de page
+  ws.headerFooter.oddFooter="&LBusiness Consulting Partners&C"+p.name+"&RPage &P / &N";
+
+  /* ========== FEUILLE 2 — SYNTHÈSE ========== */
+  const s=stats();
+  const sy=wb.addWorksheet("Synthèse",{views:[{showGridLines:false}],
+    pageSetup:{orientation:"portrait",margins:{left:0.5,right:0.5,top:0.5,bottom:0.5,header:0.2,footer:0.2}}});
+  sy.columns=[{width:4},{width:26},{width:14},{width:14},{width:14},{width:14},{width:14}];
+
+  // Titre
+  sy.mergeCells(2,2,2,7);
+  const syT=sy.getCell(2,2);
+  syT.value="SYNTHÈSE DU PLAN D'ACTION";
+  syT.font={name:"Calibri",size:15,bold:true,color:{argb:BLANC}};
+  syT.fill={type:"pattern",pattern:"solid",fgColor:{argb:BLEU}};
+  syT.alignment={vertical:"middle",horizontal:"left",indent:1};
+  sy.getRow(2).height=28;
+  sy.mergeCells(3,2,3,7);
+  const syS=sy.getCell(3,2);
+  syS.value=`${p.name}  —  ${p.client||""}  ·  ${dStr}`;
+  syS.font={size:10,italic:true,color:{argb:BLANC}};
+  syS.fill={type:"pattern",pattern:"solid",fgColor:{argb:BLEU_D}};
+  syS.alignment={vertical:"middle",horizontal:"left",indent:1};
+  sy.getRow(3).height=18;
+
+  // Cartes KPI (lignes 5-7)
+  const kpis=[
+    {label:"TOTAL ACTIONS",val:String(s.total),col:BLEU},
+    {label:"TERMINÉES",val:`${s.done} (${s.closure}%)`,col:VERT},
+    {label:"AVANCEMENT MOYEN",val:s.avgProgress+"%",col:BLEU},
+    {label:"EN RETARD",val:String(s.late),col:s.late>0?ROUGE:VERT},
+    {label:"BLOQUÉES",val:String(s.blocked),col:s.blocked>0?ROUGE:VERT}
+  ];
+  let kc=2;
+  const kpiRow=5;
+  // on place 5 KPIs sur 2 lignes fusionnées (label + valeur), colonnes B..F
+  const kpiCols=[2,3,4,5,6];
+  kpis.forEach((k,i)=>{
+    const col=kpiCols[i];
+    const cL=sy.getCell(kpiRow,col);
+    cL.value=k.label; cL.font={size:8,bold:true,color:{argb:BLANC}};
+    cL.fill={type:"pattern",pattern:"solid",fgColor:{argb:k.col}};
+    cL.alignment={vertical:"middle",horizontal:"center",wrapText:true};
+    const cV=sy.getCell(kpiRow+1,col);
+    cV.value=k.val; cV.font={size:14,bold:true,color:{argb:k.col}};
+    cV.fill={type:"pattern",pattern:"solid",fgColor:{argb:"FFFFFFFF"}};
+    cV.alignment={vertical:"middle",horizontal:"center"};
+    cV.border={bottom:{style:"medium",color:{argb:k.col}},left:{style:"hair",color:{argb:LIGNE}},right:{style:"hair",color:{argb:LIGNE}}};
+  });
+  sy.getRow(kpiRow).height=22;
+  sy.getRow(kpiRow+1).height=28;
+
+  // Tableau récap par sous-projet
+  const recapHR=9;
+  const recapHead=["Sous-projet","Total","Terminées","En cours","Bloquées","Retard","Clôture %"];
+  const rh=sy.getRow(recapHR);
+  recapHead.forEach((t,i)=>{
+    const cell=rh.getCell(i+1);
+    cell.value=t; cell.font={size:9.5,bold:true,color:{argb:BLANC}};
+    cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:VERT}};
+    cell.alignment={vertical:"middle",horizontal:(i===0?"left":"center"),wrapText:true,indent:(i===0?1:0)};
+    cell.border={bottom:{style:"thin",color:{argb:VERT}},left:{style:"hair",color:{argb:LIGNE}},right:{style:"hair",color:{argb:LIGNE}}};
+  });
+  rh.height=22;
+
+  let rr=recapHR+1;
+  const clCells=[];
+  Object.entries(groups).forEach(([sp,list],gi)=>{
+    const done=list.filter(a=>a.statut==="Terminé").length;
+    const cl=Math.round(done/list.length*100);
+    const vals=[sp,list.length,done,list.filter(a=>a.statut==="En cours").length,
+      list.filter(a=>a.statut==="Bloqué").length,list.filter(isLate).length,cl/100];
+    const bg=gi%2?GRIS_CL:BLANC;
+    vals.forEach((v,i)=>{
+      const cell=sy.getRow(rr).getCell(i+1);
+      cell.value=v; cell.font={size:9.5,color:{argb:"FF40444D"}};
+      cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:bg}};
+      cell.alignment={vertical:"middle",horizontal:(i===0?"left":"center"),wrapText:(i===0),indent:(i===0?1:0)};
+      cell.border={top:{style:"hair",color:{argb:LIGNE}},bottom:{style:"hair",color:{argb:LIGNE}},left:{style:"hair",color:{argb:LIGNE}},right:{style:"hair",color:{argb:LIGNE}}};
+      if(i===6){ cell.numFmt="0%"; clCells.push(cell.address); }
+      if(i===5 && v>0){ cell.font={size:9.5,bold:true,color:{argb:ROUGE}}; }
+    });
+    sy.getRow(rr).height=18;
+    rr++;
+  });
+  // ligne total
+  const tot=sy.getRow(rr);
+  const tvals=["TOTAL",s.total,s.done,s.doing,s.blocked,s.late,s.closure/100];
+  tvals.forEach((v,i)=>{
+    const cell=tot.getCell(i+1);
+    cell.value=v; cell.font={size:9.5,bold:true,color:{argb:i===0?BLEU:"FF40444D"}};
+    cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:BLEU_CL}};
+    cell.alignment={vertical:"middle",horizontal:(i===0?"left":"center"),indent:(i===0?1:0)};
+    cell.border={top:{style:"thin",color:{argb:BLEU}},bottom:{style:"thin",color:{argb:BLEU}}};
+    if(i===6) cell.numFmt="0%";
+  });
+  tot.height=20;
+
+  // Barre de données sur la colonne Clôture % du récap (colonne G=7)
+  sy.addConditionalFormatting({
+    ref:`G${recapHR+1}:G${rr-1}`,
+    rules:[{type:"dataBar",cfvo:[{type:"num",value:0},{type:"num",value:1}],color:{argb:BLEU},gradient:false,showValue:true,border:false}]
+  });
+
+  sy.headerFooter.oddFooter="&LBusiness Consulting Partners&RPlan d'action — "+p.name;
+
+  /* ========== Téléchargement ========== */
+  try{
+    const buf=await wb.xlsx.writeBuffer();
+    const blob=new Blob([buf],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+    const fname=`Plan_Action_${(p.code||"PRJ")}_${todayISO()}.xlsx`;
+    if(typeof saveAs!=="undefined") saveAs(blob,fname);
+    else { const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=fname; a.click(); URL.revokeObjectURL(a.href); }
+    toast("Plan d'action mis en forme exporté");
+  }catch(e){ console.error(e); toast("Erreur export : "+e.message,"warn"); }
+}
+
 function importExcel(file){
   if(!requirePerm("projects","Import Excel")) return;
   if(!file) return;
